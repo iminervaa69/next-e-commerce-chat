@@ -1,0 +1,34 @@
+{
+  "name": "chat-server",
+  "version": "1.0.0",
+  "description": "Real-time chat server with Socket.io for e-commerce",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "nodemon --exec ts-node src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "clean": "rm -rf dist"
+  },
+  "keywords": ["socket.io", "chat", "real-time", "e-commerce"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "compression": "^1.7.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/express": "^4.17.17",
+    "@types/node": "^20.0.0",
+    "@types/cors": "^2.8.13",
+    "@types/compression": "^1.7.2",
+    "ts-node": "^10.9.1",
+    "nodemon": "^3.0.1"
+  }
+}
