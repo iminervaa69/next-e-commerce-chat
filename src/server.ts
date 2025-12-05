@@ -4,8 +4,22 @@ import { Server, Socket } from 'socket.io'
 import cors from 'cors'
 import compression from 'compression'
 import dotenv from 'dotenv'
+import jwt from 'jsonwebtoken'
+import * as redisStore from './redis'
+import { Message } from './redis'
 
 dotenv.config()
+
+// Chat server secret - should match main app's CHAT_SERVER_SECRET or JWT_SECRET
+const CHAT_SECRET = process.env.CHAT_SERVER_SECRET || process.env.JWT_SECRET || 'chat-secret'
+
+interface SocketUser {
+  userId: string
+  email: string
+  role: string
+  firstName?: string
+  lastName?: string
+}
 
 const app = express()
 
@@ -28,69 +42,40 @@ const io = new Server(httpServer, {
   transports: ['websocket', 'polling']
 })
 
-// =============================================
-// DATA STRUCTURES (In-Memory)
-// =============================================
+// Socket authentication middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token || socket.handshake.query.token
 
-interface Message {
-  id: string
-  roomId: string
-  senderId: string
-  senderName: string
-  senderAvatar?: string
-  content: string | null
-  messageType: 'text' | 'system' | 'attachment'
-  attachments?: any[]
-  replyTo?: {
-    id: string
-    content: string
-    senderName: string
+  // Allow unauthenticated connections in development or if no secret is set
+  if (!token) {
+    if (process.env.NODE_ENV === 'development' || CHAT_SECRET === 'chat-secret') {
+      console.log('⚠️ Socket connected without token (dev mode)')
+      return next()
+    }
+    return next(new Error('Authentication token required'))
   }
-  status: 'sent' | 'delivered' | 'read'
-  createdAt: string
-}
 
-interface Room {
-  id: string
-  storeId: string
-  users: Map<string, { odId: string, userName: string, socketId: string, role: string }>
-  messages: Message[]
-  createdAt: string
-}
+  try {
+    const decoded = jwt.verify(token, CHAT_SECRET) as SocketUser
+    ;(socket as any).user = decoded
+    console.log(`🔐 Authenticated socket: ${decoded.email}`)
+    next()
+  } catch (err) {
+    console.error('❌ Socket auth failed:', err)
+    next(new Error('Invalid authentication token'))
+  }
+})
 
-const rooms = new Map<string, Room>()
-const userSocketMap = new Map<string, string>() // odId -> socketId
+// =============================================
+// DATA STRUCTURES (In-Memory for active connections)
+// =============================================
+
+// Only keep socket mappings in memory (Redis handles persistence)
 const socketUserMap = new Map<string, { odId: string, userName: string, userAvatar?: string, roomId: string, role: string }>()
 
 // =============================================
 // HELPER FUNCTIONS
 // =============================================
-
-const getOrCreateRoom = (roomId: string, storeId: string = ''): Room => {
-  let room = rooms.get(roomId)
-  if (!room) {
-    room = {
-      id: roomId,
-      storeId,
-      users: new Map(),
-      messages: [],
-      createdAt: new Date().toISOString()
-    }
-    rooms.set(roomId, room)
-  }
-  return room
-}
-
-const addMessage = (roomId: string, message: Message) => {
-  const room = rooms.get(roomId)
-  if (room) {
-    room.messages.push(message)
-    // Keep only last 100 messages per room to save memory
-    if (room.messages.length > 100) {
-      room.messages = room.messages.slice(-100)
-    }
-  }
-}
 
 const createSystemMessage = (roomId: string, text: string): Message => {
   return {
@@ -115,7 +100,7 @@ io.on('connection', (socket: Socket) => {
   // ==================
   // JOIN ROOM
   // ==================
-  socket.on('join_room', (data: { 
+  socket.on('join_room', async (data: { 
     roomId: string
     storeId?: string
     userId: string
@@ -129,70 +114,71 @@ io.on('connection', (socket: Socket) => {
     const previousData = socketUserMap.get(socket.id)
     if (previousData && previousData.roomId !== roomId) {
       socket.leave(previousData.roomId)
-      const prevRoom = rooms.get(previousData.roomId)
-      if (prevRoom) {
-        prevRoom.users.delete(socket.id)
-        io.to(previousData.roomId).emit('user_count', prevRoom.users.size)
-      }
+      await redisStore.removeOnlineUser(previousData.roomId, previousData.odId)
+      const prevUserCount = await redisStore.getOnlineUserCount(previousData.roomId)
+      io.to(previousData.roomId).emit('user_count', prevUserCount)
     }
 
     // Join new room
     socket.join(roomId)
-    const room = getOrCreateRoom(roomId, storeId)
-    room.users.set(socket.id, { odId: userId, userName, socketId: socket.id, role })
+    await redisStore.createRoom(roomId, storeId)
+    await redisStore.addOnlineUser(roomId, userId, { userName, role })
+    await redisStore.setUserSocket(userId, socket.id)
     
-    // Map socket to user
+    // Map socket to user (in-memory for quick lookup)
     socketUserMap.set(socket.id, { odId: userId, userName, userAvatar, roomId, role })
-    userSocketMap.set(userId, socket.id)
 
     console.log(`👤 ${userName} joined room: ${roomId}`)
 
-    // Send existing messages
-    socket.emit('load_messages', room.messages)
+    // Send existing messages from Redis
+    const messages = await redisStore.getMessages(roomId)
+    socket.emit('load_messages', messages)
 
     // Send room info
+    const roomInfo = await redisStore.getRoomInfo(roomId)
+    const userCount = await redisStore.getOnlineUserCount(roomId)
+    const messageCount = await redisStore.getMessageCount(roomId)
     socket.emit('room_info', {
       id: roomId,
-      storeId: room.storeId,
-      userCount: room.users.size,
-      messageCount: room.messages.length
+      storeId: roomInfo?.storeId || storeId,
+      userCount,
+      messageCount
     })
 
     // Notify others
     const joinMessage = createSystemMessage(roomId, `${userName} joined the chat`)
-    addMessage(roomId, joinMessage)
+    await redisStore.addMessage(roomId, joinMessage)
     socket.to(roomId).emit('new_message', joinMessage)
     
     // Broadcast user count
-    io.to(roomId).emit('user_count', room.users.size)
+    io.to(roomId).emit('user_count', userCount)
   })
 
   // ==================
   // LEAVE ROOM
   // ==================
-  socket.on('leave_room', (data: { roomId: string }) => {
+  socket.on('leave_room', async (data: { roomId: string }) => {
     const userData = socketUserMap.get(socket.id)
     if (!userData || userData.roomId !== data.roomId) return
 
     socket.leave(data.roomId)
-    const room = rooms.get(data.roomId)
-    if (room) {
-      room.users.delete(socket.id)
-      
-      const leaveMessage = createSystemMessage(data.roomId, `${userData.userName} left the chat`)
-      addMessage(data.roomId, leaveMessage)
-      socket.to(data.roomId).emit('new_message', leaveMessage)
-      io.to(data.roomId).emit('user_count', room.users.size)
-    }
+    await redisStore.removeOnlineUser(data.roomId, userData.odId)
+    await redisStore.removeUserSocket(userData.odId)
+    
+    const leaveMessage = createSystemMessage(data.roomId, `${userData.userName} left the chat`)
+    await redisStore.addMessage(data.roomId, leaveMessage)
+    socket.to(data.roomId).emit('new_message', leaveMessage)
+    
+    const userCount = await redisStore.getOnlineUserCount(data.roomId)
+    io.to(data.roomId).emit('user_count', userCount)
 
     socketUserMap.delete(socket.id)
-    userSocketMap.delete(userData.odId)
   })
 
   // ==================
   // SEND MESSAGE
   // ==================
-  socket.on('send_message', (data: { 
+  socket.on('send_message', async (data: { 
     roomId?: string
     content: string
     attachments?: any[]
@@ -205,13 +191,12 @@ io.on('connection', (socket: Socket) => {
     }
 
     const roomId = data.roomId || userData.roomId
-    const room = rooms.get(roomId)
-    if (!room) return
 
     // Find reply message if replying
     let replyTo: Message['replyTo'] | undefined
     if (data.replyToId) {
-      const replyMessage = room.messages.find(m => m.id === data.replyToId)
+      const messages = await redisStore.getMessages(roomId)
+      const replyMessage = messages.find((m: Message) => m.id === data.replyToId)
       if (replyMessage) {
         replyTo = {
           id: replyMessage.id,
@@ -222,7 +207,7 @@ io.on('connection', (socket: Socket) => {
     }
 
     const message: Message = {
-      id: `msg-${Date.now()}-${socket.id.substr(0, 6)}`,
+      id: `msg-${Date.now()}-${socket.id.substring(0, 6)}`,
       roomId,
       senderId: userData.odId,
       senderName: userData.userName,
@@ -235,7 +220,7 @@ io.on('connection', (socket: Socket) => {
       createdAt: new Date().toISOString()
     }
 
-    addMessage(roomId, message)
+    await redisStore.addMessage(roomId, message)
     
     // Broadcast to all in room (including sender)
     io.to(roomId).emit('new_message', message)
@@ -270,20 +255,14 @@ io.on('connection', (socket: Socket) => {
   // ==================
   // READ RECEIPTS
   // ==================
-  socket.on('mark_read', (data: { roomId: string, messageIds: string[] }) => {
+  socket.on('mark_read', async (data: { roomId: string, messageIds: string[] }) => {
     const userData = socketUserMap.get(socket.id)
     if (!userData) return
 
-    const room = rooms.get(data.roomId)
-    if (!room) return
-
-    // Update message statuses
-    data.messageIds.forEach(msgId => {
-      const msg = room.messages.find(m => m.id === msgId)
-      if (msg && msg.senderId !== userData.odId) {
-        msg.status = 'read'
-      }
-    })
+    // Update message statuses in Redis
+    for (const msgId of data.messageIds) {
+      await redisStore.updateMessageStatus(data.roomId, msgId, 'read')
+    }
 
     // Notify sender(s)
     socket.to(data.roomId).emit('messages_read', {
@@ -295,57 +274,37 @@ io.on('connection', (socket: Socket) => {
   // ==================
   // GET ONLINE USERS
   // ==================
-  socket.on('get_online_users', (data?: { roomId?: string }) => {
+  socket.on('get_online_users', async (data?: { roomId?: string }) => {
     const userData = socketUserMap.get(socket.id)
     if (!userData) return
 
     const roomId = data?.roomId || userData.roomId
-    const room = rooms.get(roomId)
-    if (!room) return
-
-    const onlineUsers = Array.from(room.users.values()).map(u => ({
-      userId: u.odId,
-      userName: u.userName,
-      role: u.role
-    }))
-
+    const onlineUsers = await redisStore.getOnlineUsers(roomId)
     socket.emit('online_users', onlineUsers)
   })
 
   // ==================
   // DISCONNECT
   // ==================
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     const userData = socketUserMap.get(socket.id)
     
     if (userData) {
       const { roomId, userName, odId } = userData
-      const room = rooms.get(roomId)
       
-      if (room) {
-        room.users.delete(socket.id)
-        
-        console.log(`👋 ${userName} left room: ${roomId}`)
+      await redisStore.removeOnlineUser(roomId, odId)
+      await redisStore.removeUserSocket(odId)
+      
+      console.log(`👋 ${userName} left room: ${roomId}`)
 
-        const leaveMessage = createSystemMessage(roomId, `${userName} left the chat`)
-        addMessage(roomId, leaveMessage)
-        socket.to(roomId).emit('new_message', leaveMessage)
-        io.to(roomId).emit('user_count', room.users.size)
-
-        // Clean up empty rooms after 1 minute
-        if (room.users.size === 0) {
-          setTimeout(() => {
-            const r = rooms.get(roomId)
-            if (r && r.users.size === 0) {
-              rooms.delete(roomId)
-              console.log(`🗑️  Deleted empty room: ${roomId}`)
-            }
-          }, 60000)
-        }
-      }
+      const leaveMessage = createSystemMessage(roomId, `${userName} left the chat`)
+      await redisStore.addMessage(roomId, leaveMessage)
+      socket.to(roomId).emit('new_message', leaveMessage)
+      
+      const userCount = await redisStore.getOnlineUserCount(roomId)
+      io.to(roomId).emit('user_count', userCount)
 
       socketUserMap.delete(socket.id)
-      userSocketMap.delete(odId)
     }
 
     console.log(`❌ Disconnected: ${socket.id}`)
@@ -363,30 +322,25 @@ io.on('connection', (socket: Socket) => {
 // HTTP ENDPOINTS
 // =============================================
 
-// Health check (important for Render)
-app.get('/health', (req: Request, res: Response) => {
+// Health check
+app.get('/health', async (req: Request, res: Response) => {
+  const stats = await redisStore.getAllRoomStats()
   res.json({ 
     status: 'ok',
     uptime: process.uptime(),
     connections: io.engine.clientsCount,
-    rooms: rooms.size,
+    rooms: stats.length,
     timestamp: new Date().toISOString()
   })
 })
 
 // Get server stats
-app.get('/stats', (req: Request, res: Response) => {
-  const roomStats = Array.from(rooms.entries()).map(([id, room]) => ({
-    id,
-    storeId: room.storeId,
-    users: room.users.size,
-    messages: room.messages.length,
-    createdAt: room.createdAt
-  }))
+app.get('/stats', async (req: Request, res: Response) => {
+  const roomStats = await redisStore.getAllRoomStats()
 
   res.json({
     totalConnections: io.engine.clientsCount,
-    totalRooms: rooms.size,
+    totalRooms: roomStats.length,
     rooms: roomStats,
     uptime: process.uptime()
   })
@@ -397,9 +351,62 @@ app.get('/', (req: Request, res: Response) => {
   res.json({ 
     message: 'Chat server is running',
     version: '1.0.0',
+    storage: 'redis',
     endpoints: {
       health: '/health',
-      stats: '/stats'
+      stats: '/stats',
+      config: '/api/config'
+    }
+  })
+})
+
+/**
+ * POST /api/config
+ * Get server configuration (requires API key)
+ * This endpoint is called by the main app to get chat server URL and socket token
+ */
+app.post('/api/config', (req: Request, res: Response) => {
+  const { api_key, api_secret } = req.body
+
+  const CHAT_API_KEY = process.env.CHAT_API_KEY || 'chat-api-dev-key'
+  const CHAT_API_SECRET = process.env.CHAT_API_SECRET || 'chat-api-dev-secret'
+
+  if (!api_key || !api_secret) {
+    return res.status(400).json({
+      success: false,
+      error: 'api_key and api_secret are required'
+    })
+  }
+
+  if (api_key !== CHAT_API_KEY || api_secret !== CHAT_API_SECRET) {
+    return res.status(401).json({
+      success: false,
+      error: 'Invalid API credentials'
+    })
+  }
+
+  const serverUrl = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`
+
+  // Generate a service token for socket authentication
+  const serviceToken = jwt.sign(
+    { 
+      type: 'service',
+      service: 'main-app',
+      iat: Date.now()
+    },
+    CHAT_SECRET,
+    { expiresIn: '24h' }
+  )
+
+  res.json({
+    success: true,
+    config: {
+      url: serverUrl,
+      token: serviceToken,
+      websocket: {
+        transports: ['websocket', 'polling'],
+        path: '/socket.io'
+      }
     }
   })
 })
